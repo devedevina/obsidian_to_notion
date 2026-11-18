@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-to-notion",
+  "name": "Obsidian to Notion",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "현재 노트를 이미지와 함께 Notion 데이터베이스나 페이지에 올리고, 다시 올리면 기존 페이지를 업데이트합니다.",
+  "author": "devedevina",
+  "authorUrl": "https://github.com/devedevina",
+  "isDesktopOnly": false
+}
