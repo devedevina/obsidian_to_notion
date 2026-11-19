@@ -7,6 +7,7 @@ import {
 	TFile,
 	parseFrontMatterTags,
 } from "obsidian";
+import { copyNoteForBlog } from "./blog";
 import { Block, LOCAL_FILE, markdownToBlocks } from "./markdown";
 import { NotionClient, NotionError, extractId } from "./notion";
 
@@ -74,10 +75,50 @@ export default class ObsidianToNotion extends Plugin {
 						.setIcon("upload-cloud")
 						.onClick(() => this.upload(file)),
 				);
+				menu.addItem((item) =>
+					item
+						.setTitle("블로그용으로 복사")
+						.setIcon("clipboard-copy")
+						.onClick(() => this.copyForBlog(file)),
+				);
 			}),
 		);
 
+		// Copy for blog: one click → paste into a blog editor with formatting and images.
+		this.addRibbonIcon("clipboard-copy", "블로그용으로 복사", () => {
+			const file = this.app.workspace.getActiveFile();
+			if (file && file.extension === "md") this.copyForBlog(file);
+			else new Notice("열려 있는 노트가 없어요.");
+		});
+
+		this.addCommand({
+			id: "copy-for-blog",
+			name: "블로그용으로 복사 (서식·이미지 포함)",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md") return false;
+				if (!checking) this.copyForBlog(file);
+				return true;
+			},
+		});
+
 		this.addSettingTab(new NotionSettingTab(this.app, this));
+	}
+
+	async copyForBlog(file: TFile) {
+		const progress = new Notice("블로그용으로 복사하는 중…", 0);
+		try {
+			const { images, skipped } = await copyNoteForBlog(this.app, file);
+			progress.hide();
+			new Notice(
+				`📋 복사했어요! 블로그 글쓰기 화면에 붙여넣기(Cmd/Ctrl+V) 하세요.` + (images ? `\n이미지 ${images}개 포함` : ""),
+			);
+			if (skipped.length) new Notice(`⚠️ 이미지가 아니거나 찾을 수 없어 빠진 첨부:\n${skipped.join("\n")}`, 10000);
+		} catch (e) {
+			progress.hide();
+			console.error("[obsidian-to-notion] copy for blog", e);
+			new Notice(`❌ 복사 실패: ${e instanceof Error ? e.message : String(e)}`, 10000);
+		}
 	}
 
 	async upload(file: TFile) {

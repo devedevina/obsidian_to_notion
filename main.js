@@ -22,7 +22,150 @@ __export(main_exports, {
   default: () => ObsidianToNotion
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian2 = require("obsidian");
+var import_obsidian3 = require("obsidian");
+
+// src/blog.ts
+var import_obsidian = require("obsidian");
+var FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---(\r?\n|$)/;
+var EMBED_RE = /!\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]|!\[([^\]]*)\]\(([^)\s]+)\)/g;
+var IMAGE_EXT = /* @__PURE__ */ new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]);
+var MAX_WIDTH = 1600;
+async function copyNoteForBlog(app, file) {
+  const raw = await app.vault.read(file);
+  const body = raw.replace(FRONTMATTER_RE, "");
+  const skipped = [];
+  let images = 0;
+  const md = await replaceOutsideCode(body, async (text) => {
+    const parts = [];
+    let last = 0;
+    for (const m of text.matchAll(EMBED_RE)) {
+      parts.push(text.slice(last, m.index));
+      last = (m.index ?? 0) + m[0].length;
+      const link = (m[1] ?? m[3] ?? "").trim();
+      const alt = m[2] ?? "";
+      if (/^https?:\/\//i.test(link)) {
+        parts.push(m[0]);
+        continue;
+      }
+      let path = link;
+      try {
+        path = decodeURIComponent(link.replace(/^<|>$/g, ""));
+      } catch {
+      }
+      const att = app.metadataCache.getFirstLinkpathDest(path, file.path);
+      if (!att || !IMAGE_EXT.has(att.extension.toLowerCase())) {
+        skipped.push(path);
+        continue;
+      }
+      const uri = await toDataUri(app, att);
+      images++;
+      parts.push(`![${alt.replace(/[[\]]/g, "")}](${uri})`);
+    }
+    parts.push(text.slice(last));
+    return parts.join("");
+  });
+  const holder = document.createElement("div");
+  const component = new import_obsidian.Component();
+  component.load();
+  try {
+    await import_obsidian.MarkdownRenderer.render(app, md, holder, file.path, component);
+    cleanHtml(holder);
+  } finally {
+    component.unload();
+  }
+  const html = `<meta charset="utf-8">${holder.innerHTML}`;
+  const plain = body.trim();
+  await navigator.clipboard.write([
+    new ClipboardItem({
+      "text/html": new Blob([html], { type: "text/html" }),
+      "text/plain": new Blob([plain], { type: "text/plain" })
+    })
+  ]);
+  return { images, skipped };
+}
+async function replaceOutsideCode(md, fn) {
+  const chunks = md.split(/(^[ \t]*(?:```|~~~)[\s\S]*?^[ \t]*(?:```|~~~)[ \t]*$|`[^`\n]*`)/m);
+  const out = [];
+  for (let i = 0; i < chunks.length; i++) out.push(i % 2 === 1 ? chunks[i] : await fn(chunks[i]));
+  return out.join("");
+}
+async function toDataUri(app, file) {
+  const data = await app.vault.readBinary(file);
+  const ext = file.extension.toLowerCase();
+  const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "svg" ? "image/svg+xml" : `image/${ext}`;
+  const blob = new Blob([data], { type: mime });
+  if (ext === "svg" || ext === "gif") return blobToDataUri(blob);
+  try {
+    return await downscale(blob, mime);
+  } catch {
+    return blobToDataUri(blob);
+  }
+}
+function blobToDataUri(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+async function downscale(blob, mime) {
+  const bitmap = await createImageBitmap(blob);
+  if (bitmap.width <= MAX_WIDTH) {
+    bitmap.close();
+    return blobToDataUri(blob);
+  }
+  const scale = MAX_WIDTH / bitmap.width;
+  const canvas = document.createElement("canvas");
+  canvas.width = MAX_WIDTH;
+  canvas.height = Math.round(bitmap.height * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return mime === "image/jpeg" ? canvas.toDataURL("image/jpeg", 0.9) : canvas.toDataURL("image/png");
+}
+function cleanHtml(root) {
+  root.querySelectorAll(
+    "button, .copy-code-button, .collapse-indicator, .list-collapse-indicator, .heading-collapse-indicator, .frontmatter, .frontmatter-container, .callout-icon, .callout-fold, svg"
+  ).forEach((el) => el.remove());
+  root.querySelectorAll("a.internal-link, a.tag").forEach((a) => {
+    a.replaceWith(document.createTextNode(a.textContent ?? ""));
+  });
+  root.querySelectorAll(".internal-embed").forEach((el) => {
+    const name = el.getAttribute("src") ?? el.textContent ?? "";
+    el.replaceWith(document.createTextNode(name ? `\u{1F4CE} ${name}` : ""));
+  });
+  root.querySelectorAll(".callout").forEach((c) => {
+    const bq = document.createElement("blockquote");
+    const title = c.querySelector(".callout-title")?.textContent?.trim();
+    if (title) {
+      const p = document.createElement("p");
+      const b = document.createElement("strong");
+      b.textContent = title;
+      p.appendChild(b);
+      bq.appendChild(p);
+    }
+    const content = c.querySelector(".callout-content");
+    if (content) while (content.firstChild) bq.appendChild(content.firstChild);
+    c.replaceWith(bq);
+  });
+  root.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+    const checked = cb.checked || cb.hasAttribute("checked");
+    cb.replaceWith(document.createTextNode(checked ? "\u2611 " : "\u2610 "));
+  });
+  root.querySelectorAll("img").forEach((img) => {
+    img.removeAttribute("width");
+    img.removeAttribute("height");
+    img.setAttribute("style", "max-width:100%;height:auto;");
+  });
+  root.querySelectorAll("*").forEach((el) => {
+    for (const attr of Array.from(el.attributes)) {
+      if (attr.name === "class" || attr.name.startsWith("data-") || attr.name === "dir" || attr.name === "spellcheck")
+        el.removeAttribute(attr.name);
+    }
+  });
+}
 
 // src/markdown.ts
 var MAX_TEXT = 2e3;
@@ -249,7 +392,7 @@ function nestList(items) {
   }
   return roots;
 }
-var EMBED_RE = /!\[\[([^\]|]+)(\|[^\]]*)?\]\]|!\[([^\]]*)\]\(([^)\s]+)\)/g;
+var EMBED_RE2 = /!\[\[([^\]|]+)(\|[^\]]*)?\]\]|!\[([^\]]*)\]\(([^)\s]+)\)/g;
 function extractEmbeds(text) {
   const embeds = [];
   const parts = text.split(/(`[^`]*`)/);
@@ -257,7 +400,7 @@ function extractEmbeds(text) {
   return { text: rest.replace(/[ \t]{2,}/g, " ").trim(), embeds };
 }
 function replaceEmbeds(text, embeds) {
-  return text.replace(EMBED_RE, (_all, wiki, _alias, alt, src) => {
+  return text.replace(EMBED_RE2, (_all, wiki, _alias, alt, src) => {
     if (wiki) {
       embeds.push(localFile(String(wiki).split("#")[0].trim(), ""));
     } else if (isUrl(src)) {
@@ -473,7 +616,7 @@ function markdownToBlocks(md) {
 }
 
 // src/notion.ts
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 var API = "https://api.notion.com/v1";
 var NOTION_VERSION = "2022-06-28";
 var CHUNK = 100;
@@ -511,7 +654,7 @@ var NotionClient = class {
       "Notion-Version": NOTION_VERSION
     };
     if (contentType) headers["Content-Type"] = contentType;
-    const res = await (0, import_obsidian.requestUrl)({ url: `${API}${path}`, method, headers, body, throw: false });
+    const res = await (0, import_obsidian2.requestUrl)({ url: `${API}${path}`, method, headers, body, throw: false });
     if (res.status === 429 || res.status >= 500) {
       if (attempt < 5) {
         const retry = Number(res.headers?.["retry-after"] ?? res.headers?.["Retry-After"]);
@@ -641,8 +784,8 @@ var DEFAULT_SETTINGS = {
   databaseId: "",
   tagsProperty: "Tags"
 };
-var FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---(\r?\n|$)/;
-var ObsidianToNotion = class extends import_obsidian2.Plugin {
+var FRONTMATTER_RE2 = /^---\r?\n[\s\S]*?\r?\n---(\r?\n|$)/;
+var ObsidianToNotion = class extends import_obsidian3.Plugin {
   constructor() {
     super(...arguments);
     this.settings = DEFAULT_SETTINGS;
@@ -653,7 +796,7 @@ var ObsidianToNotion = class extends import_obsidian2.Plugin {
     this.addRibbonIcon("upload-cloud", "\uD604\uC7AC \uB178\uD2B8\uB97C Notion\uC5D0 \uC62C\uB9AC\uAE30", () => {
       const file = this.app.workspace.getActiveFile();
       if (file) this.upload(file);
-      else new import_obsidian2.Notice("\uC5F4\uB824 \uC788\uB294 \uB178\uD2B8\uAC00 \uC5C6\uC5B4\uC694.");
+      else new import_obsidian3.Notice("\uC5F4\uB824 \uC788\uB294 \uB178\uD2B8\uAC00 \uC5C6\uC5B4\uC694.");
     });
     this.addCommand({
       id: "upload-current-note",
@@ -667,29 +810,64 @@ var ObsidianToNotion = class extends import_obsidian2.Plugin {
     });
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
-        if (!(file instanceof import_obsidian2.TFile) || file.extension !== "md") return;
+        if (!(file instanceof import_obsidian3.TFile) || file.extension !== "md") return;
         menu.addItem(
           (item) => item.setTitle("Notion\uC73C\uB85C \uBCF4\uB0B4\uAE30").setIcon("upload-cloud").onClick(() => this.upload(file))
         );
+        menu.addItem(
+          (item) => item.setTitle("\uBE14\uB85C\uADF8\uC6A9\uC73C\uB85C \uBCF5\uC0AC").setIcon("clipboard-copy").onClick(() => this.copyForBlog(file))
+        );
       })
     );
+    this.addRibbonIcon("clipboard-copy", "\uBE14\uB85C\uADF8\uC6A9\uC73C\uB85C \uBCF5\uC0AC", () => {
+      const file = this.app.workspace.getActiveFile();
+      if (file && file.extension === "md") this.copyForBlog(file);
+      else new import_obsidian3.Notice("\uC5F4\uB824 \uC788\uB294 \uB178\uD2B8\uAC00 \uC5C6\uC5B4\uC694.");
+    });
+    this.addCommand({
+      id: "copy-for-blog",
+      name: "\uBE14\uB85C\uADF8\uC6A9\uC73C\uB85C \uBCF5\uC0AC (\uC11C\uC2DD\xB7\uC774\uBBF8\uC9C0 \uD3EC\uD568)",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) this.copyForBlog(file);
+        return true;
+      }
+    });
     this.addSettingTab(new NotionSettingTab(this.app, this));
+  }
+  async copyForBlog(file) {
+    const progress = new import_obsidian3.Notice("\uBE14\uB85C\uADF8\uC6A9\uC73C\uB85C \uBCF5\uC0AC\uD558\uB294 \uC911\u2026", 0);
+    try {
+      const { images, skipped } = await copyNoteForBlog(this.app, file);
+      progress.hide();
+      new import_obsidian3.Notice(
+        `\u{1F4CB} \uBCF5\uC0AC\uD588\uC5B4\uC694! \uBE14\uB85C\uADF8 \uAE00\uC4F0\uAE30 \uD654\uBA74\uC5D0 \uBD99\uC5EC\uB123\uAE30(Cmd/Ctrl+V) \uD558\uC138\uC694.` + (images ? `
+\uC774\uBBF8\uC9C0 ${images}\uAC1C \uD3EC\uD568` : "")
+      );
+      if (skipped.length) new import_obsidian3.Notice(`\u26A0\uFE0F \uC774\uBBF8\uC9C0\uAC00 \uC544\uB2C8\uAC70\uB098 \uCC3E\uC744 \uC218 \uC5C6\uC5B4 \uBE60\uC9C4 \uCCA8\uBD80:
+${skipped.join("\n")}`, 1e4);
+    } catch (e) {
+      progress.hide();
+      console.error("[obsidian-to-notion] copy for blog", e);
+      new import_obsidian3.Notice(`\u274C \uBCF5\uC0AC \uC2E4\uD328: ${e instanceof Error ? e.message : String(e)}`, 1e4);
+    }
   }
   async upload(file) {
     const { token, databaseId: rawDb, tagsProperty } = this.settings;
     if (!token || !rawDb) {
-      new import_obsidian2.Notice("\uC124\uC815 \u2192 Obsidian to Notion\uC5D0\uC11C \uD1A0\uD070\uACFC \uB370\uC774\uD130\uBCA0\uC774\uC2A4 ID\uB97C \uBA3C\uC800 \uC785\uB825\uD574 \uC8FC\uC138\uC694.");
+      new import_obsidian3.Notice("\uC124\uC815 \u2192 Obsidian to Notion\uC5D0\uC11C \uD1A0\uD070\uACFC \uB370\uC774\uD130\uBCA0\uC774\uC2A4 ID\uB97C \uBA3C\uC800 \uC785\uB825\uD574 \uC8FC\uC138\uC694.");
       return;
     }
     if (this.busy.has(file.path)) return;
     this.busy.add(file.path);
-    const progress = new import_obsidian2.Notice(`Notion\uC5D0 \uC62C\uB9AC\uB294 \uC911\u2026 (${file.basename})`, 0);
+    const progress = new import_obsidian3.Notice(`Notion\uC5D0 \uC62C\uB9AC\uB294 \uC911\u2026 (${file.basename})`, 0);
     try {
       const client = new NotionClient(token);
       const db = await client.getTarget(extractId(rawDb));
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
       const raw = await this.app.vault.read(file);
-      const body = raw.replace(FRONTMATTER_RE, "");
+      const body = raw.replace(FRONTMATTER_RE2, "");
       const blocks = markdownToBlocks(body);
       const attach = await this.resolveAttachments(client, file, blocks, progress);
       const title = typeof fm.title === "string" && fm.title.trim() ? fm.title.trim() : file.basename;
@@ -697,7 +875,7 @@ var ObsidianToNotion = class extends import_obsidian2.Plugin {
         [db.titleProperty]: { title: [{ type: "text", text: { content: title.slice(0, 2e3) } }] }
       };
       if (tagsProperty && db.properties[tagsProperty]?.type === "multi_select") {
-        const tags = ((0, import_obsidian2.parseFrontMatterTags)(fm) ?? []).map((t) => t.replace(/^#/, "").replace(/,/g, " ").trim()).filter(Boolean);
+        const tags = ((0, import_obsidian3.parseFrontMatterTags)(fm) ?? []).map((t) => t.replace(/^#/, "").replace(/,/g, " ").trim()).filter(Boolean);
         properties[tagsProperty] = { multi_select: [...new Set(tags)].map((name) => ({ name: name.slice(0, 100) })) };
       }
       const existingId = typeof fm.notion_id === "string" ? fm.notion_id : void 0;
@@ -720,15 +898,15 @@ var ObsidianToNotion = class extends import_obsidian2.Plugin {
         front.notion_url = page.url;
       });
       progress.hide();
-      new import_obsidian2.Notice(updated ? `\u2705 Notion \uD398\uC774\uC9C0\uB97C \uC5C5\uB370\uC774\uD2B8\uD588\uC5B4\uC694: ${title}` : `\u2705 Notion\uC5D0 \uC0C8 \uD398\uC774\uC9C0\uB97C \uB9CC\uB4E4\uC5C8\uC5B4\uC694: ${title}`);
+      new import_obsidian3.Notice(updated ? `\u2705 Notion \uD398\uC774\uC9C0\uB97C \uC5C5\uB370\uC774\uD2B8\uD588\uC5B4\uC694: ${title}` : `\u2705 Notion\uC5D0 \uC0C8 \uD398\uC774\uC9C0\uB97C \uB9CC\uB4E4\uC5C8\uC5B4\uC694: ${title}`);
       if (attach.failed.length) {
-        new import_obsidian2.Notice(`\u26A0\uFE0F \uCCA8\uBD80\uD30C\uC77C ${attach.failed.length}\uAC1C\uB294 \uC62C\uB9AC\uC9C0 \uBABB\uD588\uC5B4\uC694:
+        new import_obsidian3.Notice(`\u26A0\uFE0F \uCCA8\uBD80\uD30C\uC77C ${attach.failed.length}\uAC1C\uB294 \uC62C\uB9AC\uC9C0 \uBABB\uD588\uC5B4\uC694:
 ${attach.failed.join("\n")}`, 12e3);
       }
     } catch (e) {
       progress.hide();
       console.error("[obsidian-to-notion]", e);
-      new import_obsidian2.Notice(`\u274C Notion \uC5C5\uB85C\uB4DC \uC2E4\uD328: ${explain(e)}`, 1e4);
+      new import_obsidian3.Notice(`\u274C Notion \uC5C5\uB85C\uB4DC \uC2E4\uD328: ${explain(e)}`, 1e4);
     } finally {
       this.busy.delete(file.path);
     }
@@ -816,7 +994,7 @@ function explain(e) {
   }
   return e instanceof Error ? e.message : String(e);
 }
-var NotionSettingTab = class extends import_obsidian2.PluginSettingTab {
+var NotionSettingTab = class extends import_obsidian3.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -824,42 +1002,42 @@ var NotionSettingTab = class extends import_obsidian2.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian2.Setting(containerEl).setName("Notion Integration \uD1A0\uD070").setDesc("notion.so/profile/integrations \uC5D0\uC11C \uB9CC\uB4E0 \uB0B4\uBD80 Integration\uC758 \uC2DC\uD06C\uB9BF \uD1A0\uD070").addText((t) => {
+    new import_obsidian3.Setting(containerEl).setName("Notion Integration \uD1A0\uD070").setDesc("notion.so/profile/integrations \uC5D0\uC11C \uB9CC\uB4E0 \uB0B4\uBD80 Integration\uC758 \uC2DC\uD06C\uB9BF \uD1A0\uD070").addText((t) => {
       t.inputEl.type = "password";
       t.setPlaceholder("ntn_...").setValue(this.plugin.settings.token).onChange(async (v) => {
         this.plugin.settings.token = v.trim();
         await this.plugin.saveSettings();
       });
     });
-    new import_obsidian2.Setting(containerEl).setName("\uB370\uC774\uD130\uBCA0\uC774\uC2A4 \uB610\uB294 \uD398\uC774\uC9C0 \uB9C1\uD06C").setDesc("\uB178\uD2B8\uB97C \uC62C\uB9B4 Notion \uB370\uC774\uD130\uBCA0\uC774\uC2A4(\uB610\uB294 \uC77C\uBC18 \uD398\uC774\uC9C0)\uC758 \uB9C1\uD06C\uB098 ID").addText(
+    new import_obsidian3.Setting(containerEl).setName("\uB370\uC774\uD130\uBCA0\uC774\uC2A4 \uB610\uB294 \uD398\uC774\uC9C0 \uB9C1\uD06C").setDesc("\uB178\uD2B8\uB97C \uC62C\uB9B4 Notion \uB370\uC774\uD130\uBCA0\uC774\uC2A4(\uB610\uB294 \uC77C\uBC18 \uD398\uC774\uC9C0)\uC758 \uB9C1\uD06C\uB098 ID").addText(
       (t) => t.setPlaceholder("https://www.notion.so/...").setValue(this.plugin.settings.databaseId).onChange(async (v) => {
         this.plugin.settings.databaseId = v.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("\uD0DC\uADF8 \uC18D\uC131 \uC774\uB984").setDesc("frontmatter\uC758 tags\uB97C \uB123\uC744 Multi-select \uC18D\uC131 \uC774\uB984. \uB370\uC774\uD130\uBCA0\uC774\uC2A4\uC5D0 \uC5C6\uC73C\uBA74 \uAC74\uB108\uB6F0\uC5B4\uC694.").addText(
+    new import_obsidian3.Setting(containerEl).setName("\uD0DC\uADF8 \uC18D\uC131 \uC774\uB984").setDesc("frontmatter\uC758 tags\uB97C \uB123\uC744 Multi-select \uC18D\uC131 \uC774\uB984. \uB370\uC774\uD130\uBCA0\uC774\uC2A4\uC5D0 \uC5C6\uC73C\uBA74 \uAC74\uB108\uB6F0\uC5B4\uC694.").addText(
       (t) => t.setValue(this.plugin.settings.tagsProperty).onChange(async (v) => {
         this.plugin.settings.tagsProperty = v.trim();
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian2.Setting(containerEl).setName("\uC5F0\uACB0 \uD14C\uC2A4\uD2B8").setDesc("\uD1A0\uD070\uACFC \uB370\uC774\uD130\uBCA0\uC774\uC2A4 \uC124\uC815\uC774 \uB9DE\uB294\uC9C0 \uD655\uC778\uD574\uC694.").addButton(
+    new import_obsidian3.Setting(containerEl).setName("\uC5F0\uACB0 \uD14C\uC2A4\uD2B8").setDesc("\uD1A0\uD070\uACFC \uB370\uC774\uD130\uBCA0\uC774\uC2A4 \uC124\uC815\uC774 \uB9DE\uB294\uC9C0 \uD655\uC778\uD574\uC694.").addButton(
       (b) => b.setButtonText("\uD14C\uC2A4\uD2B8").onClick(async () => {
         try {
           const db = await new NotionClient(this.plugin.settings.token).getTarget(
             extractId(this.plugin.settings.databaseId)
           );
           if (db.kind === "page") {
-            new import_obsidian2.Notice("\u2705 \uC5F0\uACB0 \uC131\uACF5! \uC77C\uBC18 \uD398\uC774\uC9C0\uB77C\uC11C \uB178\uD2B8\uAC00 \uC774 \uD398\uC774\uC9C0\uC758 \uD558\uC704 \uD398\uC774\uC9C0\uB85C \uC62C\uB77C\uAC00\uC694. (\uD0DC\uADF8\uB294 \uB370\uC774\uD130\uBCA0\uC774\uC2A4\uC5D0\uC11C\uB9CC \uC9C0\uC6D0)");
+            new import_obsidian3.Notice("\u2705 \uC5F0\uACB0 \uC131\uACF5! \uC77C\uBC18 \uD398\uC774\uC9C0\uB77C\uC11C \uB178\uD2B8\uAC00 \uC774 \uD398\uC774\uC9C0\uC758 \uD558\uC704 \uD398\uC774\uC9C0\uB85C \uC62C\uB77C\uAC00\uC694. (\uD0DC\uADF8\uB294 \uB370\uC774\uD130\uBCA0\uC774\uC2A4\uC5D0\uC11C\uB9CC \uC9C0\uC6D0)");
             return;
           }
           const tagProp = this.plugin.settings.tagsProperty;
           const tagOk = db.properties[tagProp]?.type === "multi_select";
-          new import_obsidian2.Notice(
+          new import_obsidian3.Notice(
             `\u2705 \uC5F0\uACB0 \uC131\uACF5! \uC81C\uBAA9 \uC18D\uC131: "${db.titleProperty}"` + (tagProp ? tagOk ? `, \uD0DC\uADF8 \uC18D\uC131: "${tagProp}"` : ` (\uD0DC\uADF8 \uC18D\uC131 "${tagProp}"\uC740 \uC5C6\uC5B4\uC11C \uAC74\uB108\uB6F0\uC5B4\uC694)` : "")
           );
         } catch (e) {
-          new import_obsidian2.Notice(`\u274C \uC5F0\uACB0 \uC2E4\uD328: ${explain(e)}`, 1e4);
+          new import_obsidian3.Notice(`\u274C \uC5F0\uACB0 \uC2E4\uD328: ${explain(e)}`, 1e4);
         }
       })
     );
